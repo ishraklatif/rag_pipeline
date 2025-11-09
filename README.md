@@ -1,5 +1,5 @@
 RAG – Lightweight Retrieval-Augmented Generation Pipeline
-OpenRAG is a modular, local-first RAG pipeline built with LangChain 1.x, Hugging Face models, and ChromaDB.
+This is a modular, local-first RAG pipeline built with LangChain 1.x, Hugging Face models, and ChromaDB.
 It retrieves knowledge from local documents or web pages, embeds them with bge-base-en-v1.5,
 and generates context-aware answers using a foundation model such as Phi-3-mini-4k-instruct.
 🚀 Features
