@@ -1,0 +1,30 @@
+# Python cache & virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env/
+
+# Mac system files
+.DS_Store
+
+# Model / cache folders
+.cache/
+huggingface/
+transformers_cache/
+
+# ChromaDB persistence
+chroma_db/
+data/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# VSCode / IDE
+.vscode/
+.idea/
