@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
+from sentence_transformers import CrossEncoder
 
 
 # --------------------------------------------------------------------------- #
@@ -33,9 +34,15 @@ Commands you can type at any time:
 """
 
 # Character budget for long-context document injection.
-# Phi-3-mini-4k:    keep at 1_800  (safe for 4k window)
-# Phi-3-mini-128k:  raise to 80_000 (safe for 128k window)
+# Phi-3-mini-128k: 80_000 is safe
 MAX_CONTEXT_CHARS = 80_000
+
+# Reranker: cross-encoder scores each (query, chunk) pair for true relevance.
+# Chunks scoring below this threshold are dropped before sending to the LLM.
+# Range is roughly -10 (irrelevant) to +10 (highly relevant).
+# 0.0 is a good starting point — raise it to be stricter, lower it to be looser.
+RERANKER_MODEL    = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANKER_THRESHOLD = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -78,21 +85,80 @@ Provide a structured comparison in your answer:
 
 
 # --------------------------------------------------------------------------- #
-# Combine retrieved chunks into context (for standard RAG)
+# Reranker
+# --------------------------------------------------------------------------- #
+def load_reranker() -> CrossEncoder:
+    """
+    Loads the cross-encoder reranker model locally.
+    Called once at startup and passed into build_rag_chain().
+    """
+    print(f"Loading reranker: {RERANKER_MODEL}")
+    return CrossEncoder(RERANKER_MODEL)
+
+
+def rerank(query: str, docs: list, reranker: CrossEncoder, threshold: float = RERANKER_THRESHOLD) -> list:
+    """
+    Re-scores retrieved chunks against the query using the cross-encoder.
+
+    Steps:
+      1. Score each (query, chunk_text) pair — cross-encoder reads both together
+      2. Attach scores to docs and sort descending
+      3. Drop any chunk below the threshold (relevance filtering)
+      4. Return at least 1 chunk even if all are below threshold (safety fallback)
+
+    Args:
+        query:     The user's question
+        docs:      List of LangChain Document objects from the retriever
+        reranker:  Loaded CrossEncoder model
+        threshold: Minimum relevance score to keep a chunk
+
+    Returns:
+        Reranked (and optionally filtered) list of Documents
+    """
+    if not docs:
+        return docs
+
+    pairs = [(query, doc.page_content) for doc in docs]
+    scores = reranker.predict(pairs)
+
+    scored = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+
+    filtered = [doc for score, doc in scored if score >= threshold]
+
+    # Safety fallback: always return at least the top-1 chunk
+    if not filtered:
+        filtered = [scored[0][1]]
+
+    return filtered
+
+
+# --------------------------------------------------------------------------- #
+# Combine docs into context string
 # --------------------------------------------------------------------------- #
 def _combine_docs(docs):
-    """Join retrieved document chunks into a single text block."""
     return "\n\n".join(doc.page_content for doc in docs)
 
 
 # --------------------------------------------------------------------------- #
-# Build the standard LCEL-style RAG chain
+# Build the RAG chain (with reranker)
 # --------------------------------------------------------------------------- #
-def build_rag_chain(llm, retriever):
+def build_rag_chain(llm, retriever, reranker: CrossEncoder):
+    """
+    Builds the classic RAG chain with reranking:
+      retriever → reranker → combine → prompt → LLM
+
+    The reranker step is wrapped in RunnableLambda so it fits
+    cleanly into the LCEL chain alongside the retriever.
+    """
     prompt = ChatPromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
 
+    def retrieve_and_rerank(question: str) -> str:
+        docs = retriever.invoke(question)
+        reranked = rerank(question, docs, reranker)
+        return _combine_docs(reranked)
+
     rag_chain = (
-        {"context": retriever | _combine_docs, "question": RunnablePassthrough()}
+        {"context": RunnableLambda(retrieve_and_rerank), "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
@@ -102,7 +168,7 @@ def build_rag_chain(llm, retriever):
 
 
 # --------------------------------------------------------------------------- #
-# Build the long-context comparison chain
+# Build the long-context comparison chain (unchanged)
 # --------------------------------------------------------------------------- #
 def build_comparison_chain(llm):
     prompt = ChatPromptTemplate.from_template(COMPARISON_PROMPT_TEMPLATE)
@@ -136,13 +202,6 @@ def is_comparison_query(query: str) -> bool:
 # Helper: format + safely truncate documents for long-context prompt
 # --------------------------------------------------------------------------- #
 def load_full_documents(docs, max_chars: int = MAX_CONTEXT_CHARS) -> str:
-    """
-    Formats documents as labelled sections and truncates the total text
-    to max_chars to stay within the model's context window.
-
-    Each document gets an equal share of the budget so no single document
-    crowds out the others.
-    """
     if not docs:
         return ""
 
@@ -164,7 +223,6 @@ def load_full_documents(docs, max_chars: int = MAX_CONTEXT_CHARS) -> str:
 
     full_text = "\n\n".join(sections)
 
-    # Final safety cut on the combined total
     if len(full_text) > max_chars:
         full_text = full_text[:max_chars] + "\n[... truncated to fit context window]"
 
@@ -175,14 +233,6 @@ def load_full_documents(docs, max_chars: int = MAX_CONTEXT_CHARS) -> str:
 # Unified interactive loop with manual mode switching
 # --------------------------------------------------------------------------- #
 def ask_hybrid(rag_chain, comparison_chain, raw_docs):
-    """
-    Interactive loop with three modes:
-      auto  — keyword router decides per question (default)
-      rag   — always use Standard RAG regardless of question
-      lc    — always use Long Context regardless of question
-
-    Switch modes at any time by typing /rag, /lc, or /auto.
-    """
     full_doc_text = load_full_documents(raw_docs)
     current_mode = MODE_AUTO
 
@@ -196,12 +246,10 @@ def ask_hybrid(rag_chain, comparison_chain, raw_docs):
         if not q:
             continue
 
-        # ---- exit ----
         if q.lower() in {"exit", "quit"}:
             print("Goodbye!")
             break
 
-        # ---- mode switch commands ----
         if q.lower() in COMMANDS:
             current_mode = COMMANDS[q.lower()]
             print(f"  Mode switched to: {MODE_LABELS[current_mode]}\n")
@@ -215,21 +263,19 @@ def ask_hybrid(rag_chain, comparison_chain, raw_docs):
             print(HELP_TEXT)
             continue
 
-        # ---- resolve which chain to use ----
         if current_mode == MODE_RAG:
             use_lc = False
         elif current_mode == MODE_LC:
             use_lc = True
-        else:  # MODE_AUTO
+        else:
             use_lc = is_comparison_query(q)
 
-        # ---- run the chain ----
         try:
             if use_lc:
                 print("  → [Long Context]")
                 ans = comparison_chain.invoke({"documents": full_doc_text, "question": q})
             else:
-                print("  → [Standard RAG]")
+                print("  → [Standard RAG + reranker]")
                 ans = rag_chain.invoke(q)
 
             print(f"\nAnswer:\n{ans}\n")

@@ -2,7 +2,7 @@ import os
 from llm import get_llm
 from ingest import load_raw_documents, chunk_documents
 from embeddings_store import build_or_load_vectorstore
-from rag_pipeline import build_rag_chain, build_comparison_chain, ask_hybrid
+from rag_pipeline import build_rag_chain, build_comparison_chain, load_reranker, ask_hybrid
 
 
 def main():
@@ -12,7 +12,7 @@ def main():
     print("  Long Context   — full document injection for comparisons\n")
 
     # ------------------------------------------------------------------ #
-    # Choose data source (unchanged from original)
+    # Choose data source
     # ------------------------------------------------------------------ #
     print("Choose your data source:")
     print("  [1] Web (https://ishraklatif.github.io)")
@@ -20,7 +20,7 @@ def main():
     print("  [3] Both sources")
     choice = input("Enter 1, 2, or 3: ").strip()
 
-    include_web = choice in ("1", "3")
+    include_web   = choice in ("1", "3")
     include_local = choice in ("2", "3")
 
     # ------------------------------------------------------------------ #
@@ -35,23 +35,28 @@ def main():
     chunks = chunk_documents(raw_docs)
 
     # ------------------------------------------------------------------ #
-    # Vectorstore + retriever (standard RAG path)
+    # Vectorstore + retriever — k=3 kept from your original
     # ------------------------------------------------------------------ #
     print("Loading or building Chroma vectorstore...")
     vectorstore = build_or_load_vectorstore(chunks)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    retriever   = vectorstore.as_retriever(search_kwargs={"k": 3})
 
     # ------------------------------------------------------------------ #
-    # Load LLM (shared by both chains)
+    # Load LLM — max_new_tokens=200 kept from your original
     # ------------------------------------------------------------------ #
     print("Loading LLM...")
     llm = get_llm(max_new_tokens=200)
 
     # ------------------------------------------------------------------ #
+    # Load reranker — new addition, required by build_rag_chain()
+    # ------------------------------------------------------------------ #
+    reranker = load_reranker()
+
+    # ------------------------------------------------------------------ #
     # Build both chains
     # ------------------------------------------------------------------ #
     print("Building RAG chain...")
-    rag_chain = build_rag_chain(llm, retriever)
+    rag_chain = build_rag_chain(llm, retriever, reranker)  # reranker is the only new arg
 
     print("Building comparison chain...")
     comparison_chain = build_comparison_chain(llm)
